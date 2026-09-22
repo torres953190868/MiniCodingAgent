@@ -4,6 +4,7 @@ import json
 import os
 import runpy
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,30 +12,33 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parent
-TASK = (
-    "请读取 calculator.py 和 test_calculator.py，为 divide 增加除数为零时的"
-    "明确报错，补充测试并运行 python test_calculator.py。"
-)
-CALCULATOR = '''def divide(a, b):
-    if b == 0:
-        raise ValueError("除数不能为零")
+TASK = "请检查 calculator.py 中的 divide 函数，运行 test_calculator.py，修复测试失败的问题并再次验证。"
+BROKEN_CALCULATOR = "def divide(a, b):\n    return a * b\n"
+FIXED_CALCULATOR = "def divide(a, b):\n    return a / b\n"
+FINAL_REPLY = '''测试通过。
+
+## 修改说明
+
+**问题**：`calculator.py` 中的 `divide` 函数实现错误，做的是乘法而不是除法：
+```python
+def divide(a, b):
+    return a * b   # 错误
+```
+
+这导致测试 `assert divide(10, 2) == 5` 失败（返回 20 而不是 5）。
+
+**修改**：将运算符由 `*` 改为 `/`：
+```python
+def divide(a, b):
     return a / b
-'''
-TEST = '''from calculator import divide
+```
 
+**测试结果**：
 
-assert divide(10, 2) == 5
-assert divide(9, 3) == 3
+- 修改前：退出码 1，`AssertionError`（断言失败）
+- 修改后：退出码 0，输出 `所有测试通过`
 
-try:
-    divide(1, 0)
-except ValueError as error:
-    assert str(error) == "除数不能为零"
-else:
-    raise AssertionError("除数为零时应抛出 ValueError")
-
-print("所有测试通过")
-'''
+未改动 `main.py` 和 `.env`。'''
 
 
 def tool_call(call_id, name, arguments):
@@ -81,36 +85,43 @@ class DemoCompletions:
         if self.round == 1:
             assert messages[-1] == {"role": "user", "content": TASK}
             answer = DemoMessage(tool_calls=[
+                tool_call("list-project", "list_files", {}),
+            ])
+        elif self.round == 2:
+            assert "calculator.py" in messages[-1]["content"]
+            answer = DemoMessage(tool_calls=[
                 tool_call("read-calculator", "read_file", {"path": "calculator.py"}),
                 tool_call("read-test", "read_file", {"path": "test_calculator.py"}),
             ])
-        elif self.round == 2:
-            assert "def divide(a, b):" in messages[-2]["content"]
+        elif self.round == 3:
+            assert messages[-2]["content"] == BROKEN_CALCULATOR
             assert "assert divide(10, 2) == 5" in messages[-1]["content"]
             answer = DemoMessage(tool_calls=[
-                tool_call("write-calculator", "write_file", {
-                    "path": "calculator.py", "content": CALCULATOR,
-                }),
-                tool_call("write-test", "write_file", {
-                    "path": "test_calculator.py", "content": TEST,
-                }),
-            ])
-        elif self.round == 3:
-            assert "文件写入成功：calculator.py" in messages[-2]["content"]
-            assert "文件写入成功：test_calculator.py" in messages[-1]["content"]
-            answer = DemoMessage(tool_calls=[
-                tool_call("run-test", "run_command", {
+                tool_call("run-test-before", "run_command", {
                     "command": "python test_calculator.py",
                 }),
             ])
         elif self.round == 4:
+            assert "退出码：1" in messages[-1]["content"]
+            assert "AssertionError" in messages[-1]["content"]
+            answer = DemoMessage(tool_calls=[
+                tool_call("write-calculator", "write_file", {
+                    "path": "calculator.py", "content": FIXED_CALCULATOR,
+                }),
+            ])
+        elif self.round == 5:
+            assert "文件写入成功：calculator.py" in messages[-1]["content"]
+            answer = DemoMessage(tool_calls=[
+                tool_call("run-test-after", "run_command", {
+                    "command": "python test_calculator.py",
+                }),
+            ])
+        elif self.round == 6:
             assert "退出码：0" in messages[-1]["content"]
             assert "所有测试通过" in messages[-1]["content"]
-            answer = DemoMessage(
-                content="已为 divide 增加除数为零时的 ValueError，补充测试；测试通过。"
-            )
+            answer = DemoMessage(content=FINAL_REPLY)
         else:
-            raise AssertionError("演示应在第 4 轮结束")
+            raise AssertionError("演示应在第 6 轮结束")
 
         return SimpleNamespace(choices=[SimpleNamespace(message=answer)])
 
@@ -121,10 +132,12 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="mini-agent-demo-") as temporary:
         workspace = Path(temporary)
-        for name in ("calculator.py", "test_calculator.py"):
+        for name in ("main.py", "test_calculator.py"):
             shutil.copy2(ROOT / name, workspace / name)
+        (workspace / "calculator.py").write_text(BROKEN_CALCULATOR, encoding="utf-8")
 
         original_directory = Path.cwd()
+        real_subprocess_run = subprocess.run
         try:
             os.chdir(workspace)
 
@@ -132,15 +145,26 @@ def main():
                 print(prompt + TASK)
                 return TASK
 
+            def normalized_run(*args, **kwargs):
+                result = real_subprocess_run(*args, **kwargs)
+                # Keep the real test result while making its traceback path stable.
+                result.stderr = result.stderr.replace(
+                    str(workspace.resolve()), "<demo-workspace>"
+                ).replace(str(workspace), "<demo-workspace>")
+                return result
+
             with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "offline-demo"}), \
                     patch("dotenv.load_dotenv"), \
                     patch("openai.OpenAI", return_value=client), \
+                    patch("subprocess.run", side_effect=normalized_run), \
                     patch("builtins.input", side_effect=demo_input):
-                runpy.run_path(str(ROOT / "main.py"), run_name="__main__")
+                runpy.run_path(str(workspace / "main.py"), run_name="__main__")
 
-            assert completions.round == 4
-            assert (workspace / "calculator.py").read_text(encoding="utf-8") == CALCULATOR
-            assert (workspace / "test_calculator.py").read_text(encoding="utf-8") == TEST
+            assert completions.round == 6
+            assert (workspace / "calculator.py").read_text(encoding="utf-8") == FIXED_CALCULATOR
+            assert (workspace / "test_calculator.py").read_text(encoding="utf-8") == (
+                ROOT / "test_calculator.py"
+            ).read_text(encoding="utf-8")
         finally:
             os.chdir(original_directory)
 

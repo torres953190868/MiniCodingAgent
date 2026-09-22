@@ -97,11 +97,17 @@ flowchart TD
     X --> T["list_files / read_file / write_file / run_command"]
     T --> P["safe_path 检查项目目录边界"]
     P --> R["文件操作或 Python 子进程"]
-    R --> O["工具结果追加到 messages"]
+    R --> O["退出码、stdout、stderr 或文件结果写回 messages"]
     O --> A
 ```
 
 核心实现在 [`main.py`](main.py)：`messages` 保存对话，模型选择工具，`available_tools` 调用本地函数，结果以 `tool` 消息写回对话。系统提示词要求先查看相关文件，修改后运行程序或测试，失败时继续修正。实际执行过程以终端中的工具结果为准；模型结束回复并不等同于测试一定通过。
+
+### Agent Loop 如何 debug
+
+这里的 debug 是根据运行结果反复定位和修复代码问题。`run_command` 会把退出码、标准输出和错误输出交还给模型；模型可以根据失败信息再次调用 `read_file` 或 `write_file`，然后重跑测试。每次调用和结果都会打印在终端，便于检查 Agent 的判断。是否能找到并修复错误取决于模型回复和最多 10 轮的限制。
+
+下面的 Demo 重现了一个具体例子：`divide(10, 2)` 因误写成 `a * b` 得到 20，测试返回 `AssertionError`；Agent 将 `*` 改为 `/` 后重跑，测试通过。
 
 ## 内置工具
 
@@ -159,23 +165,33 @@ python test_calculator.py
 python demo.py
 ```
 
-这个 Demo **不需要 API Key，也不发送网络请求**。`demo.py` 用固定的模型响应替代在线模型，但实际运行 [`main.py`](main.py) 中的 Agent Loop 和四个工具中的 `read_file`、`write_file`、`run_command`。它先把示例文件复制到临时目录，因此不会修改仓库中的 `calculator.py` 和 `test_calculator.py`。需要体验在线模型时，按[快速开始](#快速开始)配置密钥并运行 `python main.py`。
+这个 Demo **不需要 API Key，也不发送网络请求**。`demo.py` 用固定的模型响应替代在线模型，实际运行 [`main.py`](main.py) 中的 Agent Loop 和全部四个工具。它在临时目录中为 `calculator.py` 放入 `return a * b`，复制原有测试，完成“发现失败 → 修改 → 重测”。仓库中的示例文件不会被修改。需要体验在线模型时，按[快速开始](#快速开始)配置密钥并运行 `python main.py`。
 
 ### 完整 trajectory
 
-以下是执行 `python demo.py` 的完整终端记录。模型响应由 Demo 固定提供；文件读取、写入、测试输出和 Agent Loop 均由程序真实执行。每轮都列出工具调用与结果，最后一轮给出最终回复。
+以下是执行 `python demo.py` 的完整终端记录。第 6 轮回复沿用原始调试记录中的修改说明；前五轮由固定模型响应重现，文件工具、失败测试和成功重测都是真实执行。为使输出可复现，临时目录路径显示为 `<demo-workspace>`。这是一段离线重现记录，不是在线 DeepSeek 请求日志。
 
-```text
-请输入编程任务：请读取 calculator.py 和 test_calculator.py，为 divide 增加除数为零时的明确报错，补充测试并运行 python test_calculator.py。
+~~~~text
+请输入编程任务：请检查 calculator.py 中的 divide 函数，运行 test_calculator.py，修复测试失败的问题并再次验证。
 
 =============== 第 1 轮 ===============
+
+调用工具：list_files
+参数：{}
+
+工具结果：
+calculator.py
+main.py
+test_calculator.py
+
+=============== 第 2 轮 ===============
 
 调用工具：read_file
 参数：{'path': 'calculator.py'}
 
 工具结果：
 def divide(a, b):
-    return a / b
+    return a * b
 
 
 调用工具：read_file
@@ -190,23 +206,32 @@ assert divide(9, 3) == 3
 
 print("所有测试通过")
 
-=============== 第 2 轮 ===============
+=============== 第 3 轮 ===============
+
+调用工具：run_command
+参数：{'command': 'python test_calculator.py'}
+
+工具结果：
+退出码：1
+标准输出：
+
+错误输出：
+Traceback (most recent call last):
+  File "<demo-workspace>/test_calculator.py", line 4, in <module>
+    assert divide(10, 2) == 5
+AssertionError
+
+
+=============== 第 4 轮 ===============
 
 调用工具：write_file
-参数：{'path': 'calculator.py', 'content': 'def divide(a, b):\n    if b == 0:\n        raise ValueError("除数不能为零")\n    return a / b\n'}
+参数：{'path': 'calculator.py', 'content': 'def divide(a, b):\n    return a / b\n'}
 
 工具结果：
 文件写入成功：calculator.py
-共写入 85 个字符。
+共写入 35 个字符。
 
-调用工具：write_file
-参数：{'path': 'test_calculator.py', 'content': 'from calculator import divide\n\n\nassert divide(10, 2) == 5\nassert divide(9, 3) == 3\n\ntry:\n    divide(1, 0)\nexcept ValueError as error:\n    assert str(error) == "除数不能为零"\nelse:\n    raise AssertionError("除数为零时应抛出 ValueError")\n\nprint("所有测试通过")\n'}
-
-工具结果：
-文件写入成功：test_calculator.py
-共写入 239 个字符。
-
-=============== 第 3 轮 ===============
+=============== 第 5 轮 ===============
 
 调用工具：run_command
 参数：{'command': 'python test_calculator.py'}
@@ -219,13 +244,36 @@ print("所有测试通过")
 错误输出：
 
 
-=============== 第 4 轮 ===============
+=============== 第 6 轮 ===============
 
 模型：
-已为 divide 增加除数为零时的 ValueError，补充测试；测试通过。
+测试通过。
+
+## 修改说明
+
+**问题**：`calculator.py` 中的 `divide` 函数实现错误，做的是乘法而不是除法：
+```python
+def divide(a, b):
+    return a * b   # 错误
+```
+
+这导致测试 `assert divide(10, 2) == 5` 失败（返回 20 而不是 5）。
+
+**修改**：将运算符由 `*` 改为 `/`：
+```python
+def divide(a, b):
+    return a / b
+```
+
+**测试结果**：
+
+- 修改前：退出码 1，`AssertionError`（断言失败）
+- 修改后：退出码 0，输出 `所有测试通过`
+
+未改动 `main.py` 和 `.env`。
 
 Agent 已结束任务。
-```
+~~~~
 
 ## 运行边界
 

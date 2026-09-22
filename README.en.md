@@ -86,11 +86,17 @@ flowchart TD
     X --> T["list_files / read_file / write_file / run_command"]
     T --> P["safe_path checks workspace boundary"]
     P --> R["File operation or Python subprocess"]
-    R --> O["Append tool result to messages"]
+    R --> O["Return exit code, stdout, stderr, or file result in messages"]
     O --> A
 ```
 
 In [`main.py`](main.py), `messages` holds the conversation. The model selects tools; `available_tools` calls the corresponding local Python functions; each result becomes a `tool` message for the next turn. The system prompt tells the model to inspect relevant files first and run a program or test after editing. A final model reply alone does not prove that a test passed; check the tool output.
+
+### How the Agent Loop debugs code
+
+Here, debugging means using execution results to locate and fix a code error over multiple turns. `run_command` returns the exit code, stdout, and stderr to the model. The model can use a failed test to inspect or overwrite a file, then run the test again. The terminal shows every tool call and result so you can follow its decisions. A fix depends on the model's responses and the 10-turn limit.
+
+The demo below reproduces a concrete failure: `divide(10, 2)` returns 20 because the function uses `a * b`. The test fails with `AssertionError`; the agent changes `*` to `/` and reruns it successfully.
 
 ## Built-in tools
 
@@ -138,23 +144,35 @@ After installing the dependencies above, run this from the project root:
 python demo.py
 ```
 
-The demo needs **no API key or network access**. [`demo.py`](demo.py) supplies fixed model responses while executing the real Agent Loop and the `read_file`, `write_file`, and `run_command` tools from `main.py`. It copies the sample files into a temporary directory, so it does not edit the repository files. To use a live model, follow [Run the agent](#run-the-agent) and execute `python main.py`.
+The demo needs **no API key or network access**. [`demo.py`](demo.py) supplies fixed model responses while executing the real Agent Loop and all four tools from `main.py`. It seeds a `return a * b` bug in a temporary copy of `calculator.py` and uses the existing test to show failure, repair, and retesting. It does not edit repository files. To use a live model, follow [Run the agent](#run-the-agent) and execute `python main.py`.
 
 ### Complete trajectory
 
-This is the complete output of `python demo.py`. The model responses are fixed by the demo; the file operations, test output, and Agent Loop are actually executed. The program's interface and log are in Chinese. The four turns mean: **1** read both files; **2** overwrite the function and test; **3** run the test and get exit code 0; **4** give the final reply.
+This is the complete output of `python demo.py`. Turn 6 follows the final explanation from the original debugging record. Fixed model responses reconstruct turns 1–5; the file operations, failed test, and successful retest actually run. The temporary path is shown as `<demo-workspace>` to keep the output reproducible. This is an offline reconstruction, not a live DeepSeek API log. The Chinese log follows six steps: list files, read code and test, see a failing test, fix the operator, pass the test, and summarize.
 
-```text
-请输入编程任务：请读取 calculator.py 和 test_calculator.py，为 divide 增加除数为零时的明确报错，补充测试并运行 python test_calculator.py。
+Log labels: `第 N 轮` = turn N, `调用工具` = tool call, `参数` = arguments, `工具结果` = tool result, `退出码` = exit code, `标准输出` = stdout, and `错误输出` = stderr. The final reply explains that `a * b` returned 20 for `divide(10, 2)`, the initial test exited with code 1 and `AssertionError`, replacing `*` with `/` made the retest exit with code 0, and neither `main.py` nor `.env` was changed.
+
+~~~~text
+请输入编程任务：请检查 calculator.py 中的 divide 函数，运行 test_calculator.py，修复测试失败的问题并再次验证。
 
 =============== 第 1 轮 ===============
+
+调用工具：list_files
+参数：{}
+
+工具结果：
+calculator.py
+main.py
+test_calculator.py
+
+=============== 第 2 轮 ===============
 
 调用工具：read_file
 参数：{'path': 'calculator.py'}
 
 工具结果：
 def divide(a, b):
-    return a / b
+    return a * b
 
 
 调用工具：read_file
@@ -169,23 +187,32 @@ assert divide(9, 3) == 3
 
 print("所有测试通过")
 
-=============== 第 2 轮 ===============
+=============== 第 3 轮 ===============
+
+调用工具：run_command
+参数：{'command': 'python test_calculator.py'}
+
+工具结果：
+退出码：1
+标准输出：
+
+错误输出：
+Traceback (most recent call last):
+  File "<demo-workspace>/test_calculator.py", line 4, in <module>
+    assert divide(10, 2) == 5
+AssertionError
+
+
+=============== 第 4 轮 ===============
 
 调用工具：write_file
-参数：{'path': 'calculator.py', 'content': 'def divide(a, b):\n    if b == 0:\n        raise ValueError("除数不能为零")\n    return a / b\n'}
+参数：{'path': 'calculator.py', 'content': 'def divide(a, b):\n    return a / b\n'}
 
 工具结果：
 文件写入成功：calculator.py
-共写入 85 个字符。
+共写入 35 个字符。
 
-调用工具：write_file
-参数：{'path': 'test_calculator.py', 'content': 'from calculator import divide\n\n\nassert divide(10, 2) == 5\nassert divide(9, 3) == 3\n\ntry:\n    divide(1, 0)\nexcept ValueError as error:\n    assert str(error) == "除数不能为零"\nelse:\n    raise AssertionError("除数为零时应抛出 ValueError")\n\nprint("所有测试通过")\n'}
-
-工具结果：
-文件写入成功：test_calculator.py
-共写入 239 个字符。
-
-=============== 第 3 轮 ===============
+=============== 第 5 轮 ===============
 
 调用工具：run_command
 参数：{'command': 'python test_calculator.py'}
@@ -198,13 +225,36 @@ print("所有测试通过")
 错误输出：
 
 
-=============== 第 4 轮 ===============
+=============== 第 6 轮 ===============
 
 模型：
-已为 divide 增加除数为零时的 ValueError，补充测试；测试通过。
+测试通过。
+
+## 修改说明
+
+**问题**：`calculator.py` 中的 `divide` 函数实现错误，做的是乘法而不是除法：
+```python
+def divide(a, b):
+    return a * b   # 错误
+```
+
+这导致测试 `assert divide(10, 2) == 5` 失败（返回 20 而不是 5）。
+
+**修改**：将运算符由 `*` 改为 `/`：
+```python
+def divide(a, b):
+    return a / b
+```
+
+**测试结果**：
+
+- 修改前：退出码 1，`AssertionError`（断言失败）
+- 修改后：退出码 0，输出 `所有测试通过`
+
+未改动 `main.py` 和 `.env`。
 
 Agent 已结束任务。
-```
+~~~~
 
 ## Operating boundaries
 
