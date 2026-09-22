@@ -1,5 +1,7 @@
 # Mini Coding Agent
 
+[简体中文](README.md) | [English](README.en.md)
+
 一个用于学习 Coding Agent 工作原理的轻量级 Python 项目。通过 OpenAI Python SDK 调用 DeepSeek，让模型根据自然语言任务查看项目、读取和修改代码、运行 Python 脚本，并根据执行结果继续处理任务。
 
 核心逻辑集中在 `main.py`，可以直接阅读工具定义、工具调用和 Agent Loop 的实现。
@@ -82,25 +84,24 @@ Agent 会向模型发送任务，执行模型申请的工具，并将结果反�
 
 每次启动处理一个任务，对话历史仅保存在本次进程内。文件修改会直接写入磁盘。
 
-## 工作原理
+## 架构图
 
-```text
-输入编程任务
-    ↓
-将任务和工具定义发送给模型
-    ↓
-模型回复 ── 无工具调用 ──→ 结束
-    │
-    └── 有工具调用
-            ↓
-       执行本地 Python 函数
-            ↓
-       将工具结果追加到对话
-            ↓
-       进入下一轮（最多 10 轮）
+```mermaid
+flowchart TD
+    U["终端输入任务"] --> H["messages：system + user"]
+    H --> A["Agent Loop：最多 10 轮"]
+    A --> M["OpenAI SDK → DeepSeek Chat Completions"]
+    M --> D{"模型返回 tool_calls？"}
+    D -- 否 --> F["打印最终回复并结束"]
+    D -- 是 --> X["根据 available_tools 分发工具"]
+    X --> T["list_files / read_file / write_file / run_command"]
+    T --> P["safe_path 检查项目目录边界"]
+    P --> R["文件操作或 Python 子进程"]
+    R --> O["工具结果追加到 messages"]
+    O --> A
 ```
 
-系统提示词要求模型先查看相关文件，修改后运行程序或测试，失败时继续修正。实际执行过程以终端中的工具结果为准；模型结束回复并不等同于测试一定通过。
+核心实现在 [`main.py`](main.py)：`messages` 保存对话，模型选择工具，`available_tools` 调用本地函数，结果以 `tool` 消息写回对话。系统提示词要求先查看相关文件，修改后运行程序或测试，失败时继续修正。实际执行过程以终端中的工具结果为准；模型结束回复并不等同于测试一定通过。
 
 ## 内置工具
 
@@ -127,9 +128,11 @@ MiniCodingAgent/
 ├── calculator.py        # 示例：divide 除法函数
 ├── operations.py        # 示例：独立的 add 加法函数
 ├── test_calculator.py   # divide 的基础断言测试
+├── demo.py              # 不访问 API 的可复现完整演示
 ├── .env.example         # 环境变量模板
 ├── .gitignore
-└── README.md
+├── README.md            # 中文文档
+└── README.en.md         # English documentation
 ```
 
 `calculator.py`、`operations.py` 和 `test_calculator.py` 是供 Agent 练习读取、修改和验证的示例文件，不属于 Agent 核心逻辑。
@@ -146,6 +149,82 @@ python test_calculator.py
 
 ```text
 所有测试通过
+```
+
+## Demo：离线运行完整 Agent Loop
+
+安装上述依赖后，在项目根目录执行：
+
+```bash
+python demo.py
+```
+
+这个 Demo **不需要 API Key，也不发送网络请求**。`demo.py` 用固定的模型响应替代在线模型，但实际运行 [`main.py`](main.py) 中的 Agent Loop 和四个工具中的 `read_file`、`write_file`、`run_command`。它先把示例文件复制到临时目录，因此不会修改仓库中的 `calculator.py` 和 `test_calculator.py`。需要体验在线模型时，按[快速开始](#快速开始)配置密钥并运行 `python main.py`。
+
+### 完整 trajectory
+
+以下是执行 `python demo.py` 的完整终端记录。模型响应由 Demo 固定提供；文件读取、写入、测试输出和 Agent Loop 均由程序真实执行。每轮都列出工具调用与结果，最后一轮给出最终回复。
+
+```text
+请输入编程任务：请读取 calculator.py 和 test_calculator.py，为 divide 增加除数为零时的明确报错，补充测试并运行 python test_calculator.py。
+
+=============== 第 1 轮 ===============
+
+调用工具：read_file
+参数：{'path': 'calculator.py'}
+
+工具结果：
+def divide(a, b):
+    return a / b
+
+
+调用工具：read_file
+参数：{'path': 'test_calculator.py'}
+
+工具结果：
+from calculator import divide
+
+
+assert divide(10, 2) == 5
+assert divide(9, 3) == 3
+
+print("所有测试通过")
+
+=============== 第 2 轮 ===============
+
+调用工具：write_file
+参数：{'path': 'calculator.py', 'content': 'def divide(a, b):\n    if b == 0:\n        raise ValueError("除数不能为零")\n    return a / b\n'}
+
+工具结果：
+文件写入成功：calculator.py
+共写入 85 个字符。
+
+调用工具：write_file
+参数：{'path': 'test_calculator.py', 'content': 'from calculator import divide\n\n\nassert divide(10, 2) == 5\nassert divide(9, 3) == 3\n\ntry:\n    divide(1, 0)\nexcept ValueError as error:\n    assert str(error) == "除数不能为零"\nelse:\n    raise AssertionError("除数为零时应抛出 ValueError")\n\nprint("所有测试通过")\n'}
+
+工具结果：
+文件写入成功：test_calculator.py
+共写入 239 个字符。
+
+=============== 第 3 轮 ===============
+
+调用工具：run_command
+参数：{'command': 'python test_calculator.py'}
+
+工具结果：
+退出码：0
+标准输出：
+所有测试通过
+
+错误输出：
+
+
+=============== 第 4 轮 ===============
+
+模型：
+已为 divide 增加除数为零时的 ValueError，补充测试；测试通过。
+
+Agent 已结束任务。
 ```
 
 ## 运行边界
